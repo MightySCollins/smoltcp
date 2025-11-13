@@ -412,9 +412,19 @@ impl<'a> Socket<'a> {
             return;
         }
 
-        if p.question_count() != 1 {
-            net_trace!("bad question count {:?}", p.question_count());
-            return;
+        // RFC 6762 Section 6: Multicast DNS responses MUST NOT contain any questions.
+        // Regular DNS responses MUST contain exactly 1 question.
+        let is_mdns_response = udp_repr.src_port == MDNS_DNS_PORT;
+        if is_mdns_response {
+            if p.question_count() != 0 {
+                net_trace!("mDNS response has questions (should be 0): {:?}", p.question_count());
+                return;
+            }
+        } else {
+            if p.question_count() != 1 {
+                net_trace!("bad question count {:?}", p.question_count());
+                return;
+            }
         }
 
         // Find pending query
@@ -430,29 +440,35 @@ impl<'a> Socket<'a> {
                     continue;
                 }
 
-                let payload = p.payload();
-                let (mut payload, question) = match Question::parse(payload) {
-                    Ok(x) => x,
-                    Err(_) => {
-                        net_trace!("question malformed");
+                let mut payload = p.payload();
+
+                // For regular DNS, validate the question section
+                // For mDNS, there is no question section (RFC 6762 Section 6)
+                if !is_mdns_response {
+                    let (payload2, question) = match Question::parse(payload) {
+                        Ok(x) => x,
+                        Err(_) => {
+                            net_trace!("question malformed");
+                            return;
+                        }
+                    };
+                    payload = payload2;
+
+                    if question.type_ != pq.type_ {
+                        net_trace!("question type mismatch");
                         return;
                     }
-                };
 
-                if question.type_ != pq.type_ {
-                    net_trace!("question type mismatch");
-                    return;
-                }
-
-                match eq_names(p.parse_name(question.name), p.parse_name(&pq.name)) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        net_trace!("question name mismatch");
-                        return;
-                    }
-                    Err(_) => {
-                        net_trace!("dns question name malformed");
-                        return;
+                    match eq_names(p.parse_name(question.name), p.parse_name(&pq.name)) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            net_trace!("question name mismatch");
+                            return;
+                        }
+                        Err(_) => {
+                            net_trace!("dns question name malformed");
+                            return;
+                        }
                     }
                 }
 
@@ -516,11 +532,32 @@ impl<'a> Socket<'a> {
                     }
                 }
 
-                q.set_state(if addresses.is_empty() {
-                    State::Failure
-                } else {
-                    State::Completed(CompletedQuery { addresses })
-                });
+                // For mDNS queries, we need to handle empty responses differently.
+                // RFC 6762 §5.2: Receiving one response doesn't mean there won't be more.
+                // Some clients send responses with no answers, only additional records.
+                // We should continue waiting for valid responses until timeout.
+                match pq.mdns {
+                    #[cfg(feature = "socket-mdns")]
+                    MulticastDns::Enabled => {
+                        if addresses.is_empty() {
+                            // For mDNS, ignore responses with no matching answers.
+                            // Don't fail - just continue waiting for more responses.
+                            net_trace!("mDNS response with no matching answers, continuing to wait");
+                            return;
+                        } else {
+                            // Got valid mDNS answers - complete the query
+                            q.set_state(State::Completed(CompletedQuery { addresses }));
+                        }
+                    }
+                    MulticastDns::Disabled => {
+                        // For regular DNS, fail if no addresses found
+                        q.set_state(if addresses.is_empty() {
+                            State::Failure
+                        } else {
+                            State::Completed(CompletedQuery { addresses })
+                        });
+                    }
+                }
 
                 // If we get here, packet matched the current query, stop processing.
                 return;
